@@ -11,6 +11,8 @@ binding = "ASSETS"
 
 [vars]
 ENVIRONMENT = "production"
+ADMIN_USERNAME = "admin"    # 修改为你的管理员用户名
+ADMIN_PASSWORD = "rewrwr569874"
 # 注意：不要在这里硬编码管理员密码！部署时请通过
 #   `wrangler secret put ADMIN_PASSWORD`  配置强密码，
 #   未配置时使用默认 admin/admin，首次登录后请立即修改。
