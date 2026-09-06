@@ -38,12 +38,8 @@ export default defineConfig({
               dest: "static/monaco-editor",
             },
             {
-              src: "node_modules/katex/dist/katex.min.css",
+              src: "node_modules/katex/dist/*",
               dest: "static/katex",
-            },
-            {
-              src: "node_modules/katex/dist/fonts/*",
-              dest: "static/katex/fonts",
             },
             {
               src: "node_modules/mermaid/dist/mermaid.min.js",

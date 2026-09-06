@@ -15,14 +15,23 @@ export interface ShareResolveResult {
   virtualList?: boolean
 }
 
+// FIX(C-3): the old implementation only did filter(Boolean), so ".." segments
+// survived verbatim and `/@s/{id}/../../../` escalated a single-file share
+// into browsing the entire storage root (verified at runtime).
+// Backslashes are normalized first for the same reason as resolvePath (C-2).
 const normalize = (p: string) => {
-  const segments = String(p || "")
-    .split("/")
-    .filter(Boolean)
-  if (segments.includes("..")) {
-    throw new Error("无效路径: 不允许 '..' 路径段")
+  const stack: string[] = []
+  for (const seg of String(p || "")
+    .replace(/\\/g, "/")
+    .split("/")) {
+    if (seg === "" || seg === ".") continue
+    if (seg === "..") {
+      stack.pop() // clamp at the share root instead of escaping upward
+      continue
+    }
+    stack.push(seg)
   }
-  return "/" + segments.join("/")
+  return "/" + stack.join("/")
 }
 
 /**
@@ -38,14 +47,14 @@ export async function resolveShare(
   const clean = normalize(reqPath)
   const parts = clean.split("/").filter(Boolean)
   if (parts.length < 1) {
-    return { ok: false, error: "无效的分享路径" }
+    return { ok: false, error: "Invalid share path" }
   }
 
   // Strip leading "@s" segment if present
   let shareId: string
   let rest: string[]
   if (parts[0] === "@s") {
-    if (parts.length < 2) return { ok: false, error: "无效的分享路径" }
+    if (parts.length < 2) return { ok: false, error: "Invalid share path" }
     shareId = parts[1]
     rest = parts.slice(2)
   } else {
@@ -55,23 +64,23 @@ export async function resolveShare(
 
   const db = await getDb(envCtx)
   const share = (db.shares || []).find((s: any) => s.id === shareId)
-  if (!share) return { ok: false, error: "分享不存在" }
-  if (share.disabled) return { ok: false, error: "分享已被禁用" }
+  if (!share) return { ok: false, error: "share not found" }
+  if (share.disabled) return { ok: false, error: "share has been disabled" }
   if (share.expires && new Date(share.expires) < new Date()) {
-    return { ok: false, error: "分享已过期" }
+    return { ok: false, error: "share has expired" }
   }
   if (
     share.max_accessed > 0 &&
     share.accessed !== undefined &&
     share.accessed >= share.max_accessed
   ) {
-    return { ok: false, error: "分享访问次数已超出限制" }
+    return { ok: false, error: "share access count exceeded" }
   }
   if (share.pwd && share.pwd !== password) {
-    return { ok: false, error: "密码错误" }
+    return { ok: false, error: "wrong password" }
   }
   if (!share.files || share.files.length === 0) {
-    return { ok: false, error: "分享内容为空" }
+    return { ok: false, error: "share is empty" }
   }
 
   // Count this access
@@ -83,11 +92,19 @@ export async function resolveShare(
     return { ok: true, share, virtualList: true }
   }
 
-  // Single-file share
+  // FIX(C-3): containment check. Whatever normalize() produces, the result
+  // must stay inside one of the explicitly shared paths.
+  const allowedRoots: string[] = (share.files || []).map((f: string) =>
+    normalize(f),
+  )
+  const withinShare = (p: string) =>
+    allowedRoots.some((a) => p === a || p.startsWith(a === "/" ? "/" : a + "/"))
+
+  // Single-file share: one file has no sub-paths, so trailing segments are
+  // always suspicious — reject instead of concatenating them.
   if (share.files.length === 1) {
-    const base = normalize(share.files[0])
-    const real = normalize([base, ...rest].join("/"))
-    return { ok: true, share, realPath: real }
+    if (rest.length > 0) return { ok: false, error: "path not found in share" }
+    return { ok: true, share, realPath: normalize(share.files[0]) }
   }
 
   // Multi-file share, sub-path: match by basename
@@ -96,8 +113,9 @@ export async function resolveShare(
     const segs = String(f).split("/").filter(Boolean)
     return segs[segs.length - 1] === subName
   })
-  if (!match) return { ok: false, error: "分享中未找到该路径" }
+  if (!match) return { ok: false, error: "path not found in share" }
   const real = normalize([normalize(match), ...rest.slice(1)].join("/"))
+  if (!withinShare(real)) return { ok: false, error: "path not found in share" }
   return { ok: true, share, realPath: real }
 }
 

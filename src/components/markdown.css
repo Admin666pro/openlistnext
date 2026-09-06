@@ -1308,9 +1308,17 @@
 }
 
 /* markdown with word wrap */
+.markdown-body.word-wrap {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.markdown-body.word-wrap pre,
+.markdown-body.word-wrap pre > code,
 .markdown-body.word-wrap code {
-  white-space: break-spaces;
-  word-break: break-all;
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+  overflow-wrap: anywhere !important;
 }
 
 /* Fix the issue where fraction lines of $\frac{}{}$ are not displayed when using $\LaTeX$ syntax in md files */

@@ -1,7 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { Hono } from "hono"
 import { encrypt, decrypt } from "./crypto"
-import { hashPassword } from "../server/auth"
+import { hashPassword, authRouter, getOrInitUsers } from "../server/auth"
+import { saveDb, getDb } from "../internal/model/db"
 
 test("AES encrypt/decrypt produces 3-segment format and decrypts correctly", async () => {
   const secretKey = "my-test-secret-key-123456"
@@ -60,4 +62,69 @@ test("Password hashing produces consistent 64-char sha256 output", async () => {
   const hash = await hashPassword("admin")
   assert.equal(typeof hash, "string")
   assert.equal(hash.length, 64)
+})
+
+test("getOrInitUsers preserves a legacy PBKDF2 admin hash instead of silently resetting to admin/admin", async () => {
+  const env: any = {}
+  // 隔离 CI 环境变量：若 CI 设置了 ADMIN_PASSWORD，getOrInitUsers 会优先取
+  // process.env.ADMIN_PASSWORD，导致断言失败
+  delete process.env.ADMIN_PASSWORD
+  // Simulate leftover from the PBKDF2 build (PR #33 era): stored hash is
+  // `pbkdf2:100000:<salt>:<hash>`, unverifiable by the current SHA-256 scheme.
+  const fakePdkdf2Hash = `pbkdf2:100000:${"a".repeat(64)}:${"b".repeat(64)}`
+  await saveDb(
+    {
+      settings: [],
+      users: [
+        {
+          id: 1,
+          username: "admin",
+          password: fakePdkdf2Hash,
+          role: 2,
+          permission: 0,
+          base_path: "/",
+          disabled: false,
+        },
+        {
+          id: 2,
+          username: "guest",
+          password: "",
+          role: 1,
+          permission: 0,
+          base_path: "/",
+          disabled: false,
+        },
+      ],
+      storages: [],
+      shares: [],
+    },
+    env,
+  )
+
+  // FIX(F-11): this test used to assert the OPPOSITE — that the legacy hash
+  // was reset so that admin/admin could log in. That "upgrade reopens the
+  // admin account to a well-known password" behavior was itself a
+  // vulnerability; the fix deliberately preserves an unverifiable legacy
+  // hash (with a warning logged) and never falls back to a default.
+  const { users } = await getOrInitUsers(env)
+  const admin = users.find((u: any) => u.username === "admin")
+  assert.equal(
+    admin.password,
+    fakePdkdf2Hash,
+    "a legacy-format hash must be preserved, never silently reset",
+  )
+  assert.notEqual(admin.password, await hashPassword("admin"))
+
+  const app = new Hono()
+  app.route("/api/auth", authRouter)
+  const res = await app.request("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "admin", password: "admin" }),
+  })
+  assert.notEqual(
+    res.status,
+    200,
+    "admin/admin must NOT log in against a preserved legacy hash",
+  )
 })

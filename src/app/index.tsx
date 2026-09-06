@@ -49,9 +49,10 @@ const Index = () => {
             }, 300)
             return <FullScreenLoading />
           }
-          return <Error msg={`系统错误：${err}`} h="100vh" />
+          return <Error msg={`System error: ${err}`} h="100vh" />
         }}
       >
+        {/* 通知默认右上角;搜索框已通过 header-right z-index(1810) 提层,公告弹出不遮挡 */}
         <NotificationsProvider duration={3000}>
           <Suspense fallback={<FullScreenLoading />}>
             <App />

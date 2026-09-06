@@ -44,6 +44,12 @@ export const MonacoEditor = (props: MonacoEditorProps) => {
       value: props.value,
       theme: props.theme,
       fontSize: parseInt(local.editor_font_size),
+      wordWrap: "on",
+      automaticLayout: true,
+      wrappingStrategy: "advanced",
+      scrollbar: {
+        alwaysConsumeMouseWheel: false,
+      },
     })
     model = monaco.editor.createModel(
       props.value,
@@ -66,6 +72,8 @@ export const MonacoEditor = (props: MonacoEditorProps) => {
   createEffect(() => {
     monacoEditor?.updateOptions({
       fontSize: parseInt(local.editor_font_size),
+      wordWrap: "on",
+      automaticLayout: true,
     })
   })
 

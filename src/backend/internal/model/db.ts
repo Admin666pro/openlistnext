@@ -616,8 +616,6 @@ export const defaultDb = {
       sso_id: "",
       allow_ldap: false,
       pwd_update_at: new Date().toISOString(),
-      otp_secret: "",
-      otp_enabled: false,
     },
     {
       id: 2,
@@ -626,12 +624,10 @@ export const defaultDb = {
       role: 1,
       permission: 0,
       base_path: "/",
-      disabled: true,
+      disabled: false,
       sso_id: "",
       allow_ldap: false,
       pwd_update_at: new Date().toISOString(),
-      otp_secret: "",
-      otp_enabled: false,
     },
   ],
   metas: [],
@@ -866,22 +862,21 @@ async function saveToKv(
     if (mode === "blob") {
       // @edgeone/pages-blob SDK: setJSON(key, value) for structured data
       if (typeof binding.setJSON === "function") {
-        await binding.setJSON(key, data)
-        return true
+        return (await binding.setJSON(key, data)) !== false
       }
       // Fallback: set(key, stringified)
       if (typeof binding.set === "function") {
-        await binding.set(key, valStr)
-        return true
+        return (await binding.set(key, valStr)) !== false
       }
     } else if (mode === "binding") {
+      // NOTE: only an explicit `false` counts as failure. Cloudflare KV's
+      // put() resolves to void, so `undefined` must stay a success —
+      // otherwise every normal write would be reported as failed.
       if (typeof binding.put === "function") {
-        await binding.put(key, valStr)
-        return true
+        return (await binding.put(key, valStr)) !== false
       }
       if (typeof binding.set === "function") {
-        await binding.set(key, valStr)
-        return true
+        return (await binding.set(key, valStr)) !== false
       }
     } else if (binding.type === "cf_rest") {
       const url = `https://api.cloudflare.com/client/v4/accounts/${binding.accountId}/storage/kv/namespaces/${binding.namespaceId}/values/${key}`
@@ -1027,35 +1022,32 @@ const ensureDefaultPlugins = (db: any) => {
   }
 }
 
-const ensureDefaultUsers = (db: any) => {
-  if (!db) return
-  if (!db.users) {
-    db.users = []
-  }
-  // Ensure guest user always exists (disabled by default for security)
-  const guest = db.users.find((u: any) => u.username === "guest")
-  if (!guest) {
-    db.users.push({
-      id: db.users.length
-        ? Math.max(...db.users.map((u: any) => u.id || 0)) + 1
-        : 2,
-      username: "guest",
-      password: "",
-      role: 1,
-      permission: 0,
-      base_path: "/",
-      disabled: true,
-      sso_id: "",
-      allow_ldap: false,
-      pwd_update_at: new Date().toISOString(),
-      otp_secret: "",
-      otp_enabled: false,
-    })
-  }
-  // Do NOT re-enable guest if admin disabled it — this is intentional
-}
+/**
+ * Request-scoped memoization for getDb().
+ *
+ * A single /api/fs/list triggers 6-8 full KV reads plus a full JSON.parse of
+ * the config. Alibaba ESA caps a request at exactly 8 KV subrequests, so one
+ * directory listing could exhaust the budget on its own.
+ *
+ * Two layers:
+ *  1. in-flight de-duplication — concurrent callers share one KV read.
+ *  2. short-TTL memoization — sequential calls within a request reuse it.
+ *
+ * Trade-off worth knowing: on Workers `env` is shared across requests within
+ * an isolate, so a cache hung directly on it would never expire.
+ * AsyncLocalStorage would give exact per-request scope but is unavailable on
+ * EdgeOne/ESA/Vercel (nodejs_compat is only declared in wrangler.toml). A 1s
+ * TTL is the portable middle ground — worst case a concurrent isolate sees
+ * config up to 1s stale, and saveDb() refreshes the cache on every write.
+ *
+ * TODO: threading `db` down from the handler gives exact per-request scope,
+ * but touches all ~83 call sites.
+ */
+const DB_CACHE_TTL_MS = 1000
+const dbCache = new WeakMap<object, { ts: number; db: any }>()
+const dbInflight = new WeakMap<object, Promise<any>>()
 
-export const getDb = async (envCtx?: any) => {
+const loadDb = async (envCtx?: any) => {
   if (envCtx) {
     globalEnvCtx = envCtx
   }
@@ -1071,7 +1063,6 @@ export const getDb = async (envCtx?: any) => {
         ensureDefaultStorages(memoryDb)
         ensureDefaultShares(memoryDb)
         ensureDefaultPlugins(memoryDb)
-        ensureDefaultUsers(memoryDb)
         return memoryDb
       }
     } catch (err) {
@@ -1084,7 +1075,6 @@ export const getDb = async (envCtx?: any) => {
     ensureDefaultStorages(memoryDb)
     ensureDefaultShares(memoryDb)
     ensureDefaultPlugins(memoryDb)
-    ensureDefaultUsers(memoryDb)
     return memoryDb
   }
 
@@ -1100,7 +1090,6 @@ export const getDb = async (envCtx?: any) => {
       ensureDefaultStorages(memoryDb)
       ensureDefaultShares(memoryDb)
       ensureDefaultPlugins(memoryDb)
-      ensureDefaultUsers(memoryDb)
       return memoryDb
     } catch (err) {
       console.error("Failed to parse DATABASE_JSON env variable:", err)
@@ -1112,35 +1101,85 @@ export const getDb = async (envCtx?: any) => {
   ensureDefaultStorages(memoryDb)
   ensureDefaultShares(memoryDb)
   ensureDefaultPlugins(memoryDb)
-  ensureDefaultUsers(memoryDb)
   return memoryDb
 }
 
-export const saveDb = async (data: any, envCtx?: any) => {
+export const getDb = async (envCtx?: any) => {
+  if (envCtx) {
+    globalEnvCtx = envCtx
+  }
+  // envCtx is the cache key — without it there is nothing safe to scope to.
+  if (!envCtx) return loadDb(envCtx)
+
+  // 1) Concurrent de-duplication: concurrent callers share a single KV read.
+  const pending = dbInflight.get(envCtx)
+  if (pending) return pending
+
+  // 2) Short-TTL memoization: sequential calls in one request reuse the result.
+  const hit = dbCache.get(envCtx)
+  if (hit && Date.now() - hit.ts < DB_CACHE_TTL_MS) return hit.db
+
+  const promise = loadDb(envCtx)
+    .then((db) => {
+      dbCache.set(envCtx, { ts: Date.now(), db })
+      return db
+    })
+    .finally(() => {
+      dbInflight.delete(envCtx)
+    })
+  dbInflight.set(envCtx, promise)
+  return promise
+}
+
+/**
+ * Persist the config. Returns whether the write actually landed.
+ *
+ * FIX: persistence failures used to be swallowed here with a console.error and
+ * a void return, so callers could not tell a saved change from a lost one.
+ * The next read would then fall back to defaults and silently overwrite real
+ * config — the "config reverted to default" SEV2 in the incident report.
+ *
+ * Throwing is deliberately scoped to *failed writes*: when no KV binding is
+ * configured at all (in-memory / container mode) this keeps the historical
+ * warn-and-continue behavior, so unpersisted deployments are not broken by it.
+ */
+export const saveDb = async (data: any, envCtx?: any): Promise<boolean> => {
   if (envCtx) {
     globalEnvCtx = envCtx
   }
   memoryDb = data
+  // Refresh the request cache so any getDb() later in this request observes
+  // the write rather than a pre-write snapshot.
+  if (envCtx) dbCache.set(envCtx, { ts: Date.now(), db: data })
 
-  // Save to Blob / KV
   const kvInfo = await getKvBinding(envCtx)
-  if (kvInfo.mode !== "none") {
-    const success = await saveToKv(kvInfo, "openlistnext_config", data).catch(
-      (err) => {
-        console.error("[DB] Failed to save to KV:", err)
-        return false
-      },
-    )
-    if (success) {
-      console.log(
-        `[DB] Successfully persisted ${data.storages?.length || 0} storages to KV (${kvInfo.platform})`,
-      )
-    }
-  } else {
+  if (kvInfo.mode === "none") {
+    // No persistence configured — not a failed write, just an unpersisted
+    // deployment. Preserve the old non-throwing behavior.
     console.warn(
       "[DB] WARNING: No KV binding found! Storage configuration changes will exist only in memory!",
     )
+    return false
   }
+
+  let success = false
+  try {
+    success = await saveToKv(kvInfo, "openlistnext_config", data)
+  } catch (err) {
+    console.error("[DB] Failed to save to KV:", err)
+    success = false
+  }
+
+  if (!success) {
+    throw new Error(
+      `[DB] Failed to persist config to KV (${kvInfo.platform}); the change was NOT saved`,
+    )
+  }
+
+  console.log(
+    `[DB] Successfully persisted ${data.storages?.length || 0} storages to KV (${kvInfo.platform})`,
+  )
+  return true
 }
 
 export async function getKvStatus(envCtx?: any) {
@@ -1183,11 +1222,21 @@ export async function resolvePath(virtualPath: string) {
   // mount root (path traversal). A leading ".." that pops an empty stack
   // is clamped to the root instead of escaping upward.
   const stack: string[] = []
-  for (const seg of String(virtualPath || "").split("/")) {
+  // FIX(C-2): backslashes must be normalized BEFORE segmenting, not after.
+  // The old code split on "/" only, so "..\..\.." stayed a single opaque
+  // segment and was pushed verbatim onto the stack; the later
+  // .replace(/\\/g,"/") on physicalPath then turned it into real "..",
+  // escaping the storage root (CWE-22, verified at runtime).
+  for (const seg of String(virtualPath || "")
+    .replace(/\\/g, "/")
+    .split("/")) {
     if (seg === "" || seg === ".") continue
     if (seg === "..") {
       stack.pop()
       continue
+    }
+    if (seg.includes("\0")) {
+      throw new Error("invalid path: null byte")
     }
     stack.push(seg)
   }
@@ -1208,7 +1257,9 @@ export async function resolvePath(virtualPath: string) {
   )
 
   if (activeStorages.length === 0) {
-    throw new Error("获取存储失败: 未找到存储；请先添加一个存储")
+    throw new Error(
+      "failed get storage: storage not found; please add a storage first",
+    )
   }
 
   const sortedStorages = [...activeStorages].sort((a: any, b: any) => {
@@ -1257,6 +1308,21 @@ export async function resolvePath(virtualPath: string) {
       // split into segments) while normalizing separators and slashes.
       const physicalPath = (parts.join("/") || "/").replace(/\/{2,}/g, "/")
 
+      // FIX(C-2): defense-in-depth. Even if the normalization above ever
+      // regresses, the resolved physical path may never leave rootFolder.
+      // A rootFolder of "" or "/" means "no restriction", hence the skip.
+      const rootNorm =
+        String(rootFolder || "/")
+          .replace(/\\/g, "/")
+          .replace(/\/+$/, "") || "/"
+      if (
+        rootNorm !== "/" &&
+        physicalPath !== rootNorm &&
+        !physicalPath.startsWith(rootNorm + "/")
+      ) {
+        throw new Error("path traversal blocked: escapes storage root")
+      }
+
       return {
         storage,
         relative: relPath,
@@ -1292,7 +1358,7 @@ export async function resolvePath(virtualPath: string) {
     }
   }
 
-  throw new Error("获取存储失败: 未找到存储")
+  throw new Error("failed get storage: storage not found")
 }
 
 export async function getSettings() {

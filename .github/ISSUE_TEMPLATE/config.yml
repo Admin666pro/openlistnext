@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🚀 OpenList-Worker (Official Repository)
+    url: https://github.com/OpenListTeam/OpenList-Worker/issues
+    about: OpenListNext has merged into OpenList-Worker. Please submit all new issues and feature requests there.
+  - name: 📖 Migration Guide
+    url: https://github.com/Polonium-salts/openlistnext/blob/main/docs/MIGRATION.md
+    about: How to migrate your OpenListNext setup to OpenList-Worker.

@@ -43,9 +43,6 @@ export const useDownload = () => {
   const { pathname, isShare } = useRouter()
   return {
     batchDownloadSelected: () => {
-      // Download URLs now carry the JWT as a query param (?token=...), so a
-      // native window.open works: backend authenticates from the query param,
-      // then 302-redirects to the S3 pre-signed URL (no CORS issue).
       const urls = rawLinks(true)
       urls.forEach((url) => {
         window.open(url, "_blank")
@@ -68,6 +65,7 @@ export const useDownload = () => {
                 "direct",
                 isShare(),
                 true,
+                true, // aria2 无法携带 cookie，需在 URL 中带分享密码
               ),
               name: obj.name,
             },
